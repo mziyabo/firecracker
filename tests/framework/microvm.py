@@ -18,10 +18,12 @@ import time
 from subprocess import run, PIPE
 
 from retry import retry
+from retry.api import retry_call
 
 import host_tools.memory as mem_tools
 import host_tools.network as net_tools
 
+import framework.utils as utils
 from framework.defs import MICROVM_KERNEL_RELPATH, MICROVM_FSFILES_RELPATH
 from framework.http import Session
 from framework.jailer import JailerContext
@@ -47,17 +49,12 @@ class Microvm:
         fc_binary_path,
         jailer_binary_path,
         microvm_id,
-        build_feature='',
         monitor_memory=True,
         bin_cloner_path=None,
-        config_file=None,
-        no_api=False,
     ):
         """Set up microVM attributes, paths, and data structures."""
         # Unique identifier for this machine.
         self._microvm_id = microvm_id
-
-        self.build_feature = build_feature
 
         # Compose the paths to the resources specific to this microvm.
         self._path = os.path.join(resource_path, microvm_id)
@@ -101,13 +98,6 @@ class Microvm:
         self.network = None
         self.machine_cfg = None
         self.vsock = None
-
-        # Optional file that contains a json for configuring microvm from
-        # command line parameter.
-        self.config_file = config_file
-
-        # Parameter set when user wants to disable API thread.
-        self.no_api = no_api
 
         # The ssh config dictionary is populated with information about how
         # to connect to a microVM that has ssh capability. The path of the
@@ -287,8 +277,7 @@ class Microvm:
         self.network = Network(self._api_socket, self._api_session)
         self.vsock = Vsock(self._api_socket, self._api_session)
 
-        jailer_param_list = self._jailer.construct_param_list(self.config_file,
-                                                              self.no_api)
+        jailer_param_list = self._jailer.construct_param_list()
 
         # When the daemonize flag is on, we want to clone-exec into the
         # jailer rather than executing it via spawning a shell. Going
@@ -346,10 +335,24 @@ class Microvm:
 
             run(start_cmd, shell=True, check=True)
 
-            out = run('screen -ls', shell=True, stdout=PIPE)\
-                .stdout.decode('utf-8')
-            screen_pid = re.search(r'([0-9]+)\.{}'.format(self._session_name),
-                                   out).group(1)
+            # Build a regex object to match (number).session_name
+            regex_object = re.compile(
+                r'([0-9]+)\.{}'.format(self._session_name))
+
+            # Run 'screen -ls' in a retry_call loop, 30 times with a one
+            # second delay between calls.
+            # If the output of 'screen -ls' matches the regex object, it will
+            # return the PID. Otherwise a RuntimeError will be raised.
+            screen_pid = retry_call(
+                utils.search_output_from_cmd,
+                fkwargs={
+                    "cmd": 'screen -ls',
+                    "find_regex": regex_object
+                },
+                exceptions=RuntimeError,
+                tries=30,
+                delay=1).group(1)
+
             self.jailer_clone_pid = open('/proc/{0}/task/{0}/children'
                                          .format(screen_pid)
                                          ).read().strip()
@@ -364,7 +367,7 @@ class Microvm:
         # We expect the jailer to start within 80 ms. However, we wait for
         # 1 sec since we are rechecking the existence of the socket 5 times
         # and leave 0.2 delay between them.
-        if not self.no_api:
+        if 'no-api' not in self._jailer.extra_args:
             self._wait_create()
 
     @retry(delay=0.2, tries=5)

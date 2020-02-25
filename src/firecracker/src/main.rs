@@ -2,19 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 extern crate backtrace;
-#[macro_use(crate_version, crate_authors)]
-extern crate clap;
-extern crate api_server;
 extern crate libc;
-extern crate utils;
+
+extern crate api_server;
 #[macro_use]
 extern crate logger;
 extern crate mmds;
 extern crate seccomp;
+extern crate utils;
 extern crate vmm;
 
 use backtrace::Backtrace;
-use clap::{App, Arg};
 
 use std::fs;
 use std::io;
@@ -28,48 +26,22 @@ use std::thread;
 use api_server::{ApiServer, Error, VmmRequest, VmmResponse};
 use logger::{Metric, LOGGER, METRICS};
 use mmds::MMDS;
-use seccomp::SeccompFilter;
+use seccomp::{BpfInstructionSlice, BpfProgram, SeccompLevel};
+use utils::arg_parser::{ArgParser, Argument};
 use utils::eventfd::EventFd;
 use utils::terminal::Terminal;
 use utils::validators::validate_instance_id;
-use vmm::default_syscalls::default_filter;
+use vmm::default_syscalls::get_seccomp_filter;
 use vmm::signal_handler::register_signal_handlers;
 use vmm::vmm_config::instance_info::{InstanceInfo, InstanceState};
 use vmm::{EventLoopExitReason, Vmm};
 
-const DEFAULT_API_SOCK_PATH: &str = "/tmp/firecracker.socket";
+// The reason we place default API socket under /run is that API socket is a
+// runtime file.
+// see https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch03s15.html for more information.
+const DEFAULT_API_SOCK_PATH: &str = "/run/firecracker.socket";
 const DEFAULT_INSTANCE_ID: &str = "anonymous-instance";
-
-/// Level of filtering that causes syscall numbers and parameters to be examined.
-const SECCOMP_LEVEL_ADVANCED: u32 = 2;
-/// Level of filtering that causes only syscall numbers to be examined.
-const SECCOMP_LEVEL_BASIC: u32 = 1;
-/// Seccomp filtering disabled.
-const SECCOMP_LEVEL_NONE: u32 = 0;
-
-/// Possible errors that could be encountered while processing seccomp levels from CLI
-#[derive(Debug)]
-enum SeccompFilterError {
-    Seccomp(seccomp::Error),
-    Parse(std::num::ParseIntError),
-    Level(String),
-}
-
-/// Parse seccomp level and generate a SeccompFilter based on it.
-fn get_seccomp_filter(val: &str) -> Result<SeccompFilter, SeccompFilterError> {
-    match val.parse::<u32>() {
-        Ok(SECCOMP_LEVEL_NONE) => Ok(SeccompFilter::empty()),
-        Ok(SECCOMP_LEVEL_BASIC) => Ok(default_filter()
-            .map_err(SeccompFilterError::Seccomp)?
-            .allow_all()),
-        Ok(SECCOMP_LEVEL_ADVANCED) => default_filter().map_err(SeccompFilterError::Seccomp),
-        Ok(level) => Err(SeccompFilterError::Level(format!(
-            "Invalid value for seccomp level: {}",
-            level
-        ))),
-        Err(err) => Err(SeccompFilterError::Parse(err)),
-    }
-}
+const FIRECRACKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
     LOGGER
@@ -109,105 +81,114 @@ fn main() {
         }
     }));
 
-    let cmd_arguments = App::new("firecracker")
-        .version(crate_version!())
-        .author(crate_authors!())
-        .about("Launch a microvm.")
+    let mut arg_parser = ArgParser::new()
         .arg(
-            Arg::with_name("api_sock")
-                .long("api-sock")
-                .help("Path to unix domain socket used by the API")
+            Argument::new("api-sock")
                 .takes_value(true)
-                .default_value(DEFAULT_API_SOCK_PATH),
+                .default_value(DEFAULT_API_SOCK_PATH)
+                .help("Path to unix domain socket used by the API."),
         )
         .arg(
-            Arg::with_name("id")
-                .long("id")
-                .help("MicroVM unique identifier")
+            Argument::new("id")
                 .takes_value(true)
                 .default_value(DEFAULT_INSTANCE_ID)
-                .validator(|s: String| -> Result<(), String> {
-                    validate_instance_id(&s).map_err(|e| format!("{}", e))
-                }),
+                .help("MicroVM unique identifier."),
         )
         .arg(
-            Arg::with_name("seccomp-level")
-                .long("seccomp-level")
-                .help(
-                    "Level of seccomp filtering.\n
-                            - Level 0: No filtering.\n
-                            - Level 1: Seccomp filtering by syscall number.\n
-                            - Level 2: Seccomp filtering by syscall number and argument values.\n
-                        ",
-                )
+            Argument::new("seccomp-level")
                 .takes_value(true)
                 .default_value("2")
-                .possible_values(&["0", "1", "2"]),
+                .help(
+                    "Level of seccomp filtering that will be passed to executed path as \
+                    argument.\n
+                        - Level 0: No filtering.\n
+                        - Level 1: Seccomp filtering by syscall number.\n
+                        - Level 2: Seccomp filtering by syscall number and argument values.\n
+                    ",
+                ),
         )
         .arg(
-            Arg::with_name("start-time-us")
-                .long("start-time-us")
+            Argument::new("start-time-us")
+                .takes_value(true),
+        )
+        .arg(
+            Argument::new("start-time-cpu-us")
+                .takes_value(true),
+        )
+        .arg(
+            Argument::new("config-file")
                 .takes_value(true)
-                .hidden(true),
+                .help("Path to a file that contains the microVM configuration in JSON format."),
         )
         .arg(
-            Arg::with_name("start-time-cpu-us")
-                .long("start-time-cpu-us")
-                .takes_value(true)
-                .hidden(true),
-        )
-        .arg(
-            Arg::with_name("config-file")
-                .long("config-file")
-                .help("Path to a file that contains the microVM configuration in JSON format.")
-                .takes_value(true)
-                .required(false),
-        )
-        .arg(
-            Arg::with_name("no-api")
-                .long("no-api")
-                .help("Optional parameter which allows starting and using a microVM without an active API socket.")
+            Argument::new("no-api")
                 .takes_value(false)
-                .required(false)
                 .requires("config-file")
-        )
-        .get_matches();
+                .help("Optional parameter which allows starting and using a microVM without an active API socket.")
+        );
 
-    let bind_path = cmd_arguments
-        .value_of("api_sock")
+    let arguments = match arg_parser.parse_from_cmdline() {
+        Err(err) => {
+            error!(
+                "Arguments parsing error: {} \n\n\
+                 For more information try --help.",
+                err
+            );
+            process::exit(i32::from(vmm::FC_EXIT_CODE_ARG_PARSING));
+        }
+        _ => {
+            if let Some(help) = arg_parser.arguments().value_as_bool("help") {
+                if help {
+                    println!("Firecracker v{}\n", FIRECRACKER_VERSION);
+                    println!("{}", arg_parser.formatted_help());
+                    process::exit(i32::from(vmm::FC_EXIT_CODE_OK));
+                }
+            }
+            arg_parser.arguments()
+        }
+    };
+
+    let bind_path = arguments
+        .value_as_string("api-sock")
         .map(PathBuf::from)
         .expect("Missing argument: api_sock");
 
-    // It's safe to unwrap here because clap's been provided with a default value
-    let instance_id = cmd_arguments.value_of("id").unwrap().to_string();
+    // It's safe to unwrap here because the field's been provided with a default value.
+    let instance_id = arguments.value_as_string("id").unwrap();
+    validate_instance_id(instance_id.as_str()).expect("Invalid instance ID");
 
-    // It's safe to unwrap here because clap's been provided with a default value,
-    // and allowed values are guaranteed to parse to u32.
-    let seccomp_level = cmd_arguments.value_of("seccomp-level").unwrap();
-    let seccomp_filter =
-        get_seccomp_filter(seccomp_level).expect("Could not create seccomp filter");
+    // It's safe to unwrap here because the field's been provided with a default value.
+    let seccomp_level = arguments.value_as_string("seccomp-level").unwrap();
+    let seccomp_filter = get_seccomp_filter(
+        SeccompLevel::from_string(seccomp_level).unwrap_or_else(|err| {
+            panic!("Invalid value for seccomp-level: {}", err);
+        }),
+    )
+    .unwrap_or_else(|err| {
+        panic!("Could not create seccomp filter: {}", err);
+    });
 
-    let start_time_us = cmd_arguments.value_of("start-time-us").map(|s| {
+    let start_time_us = arguments.value_as_string("start-time-us").map(|s| {
         s.parse::<u64>()
             .expect("'start-time-us' parameter expected to be of 'u64' type.")
     });
 
-    let start_time_cpu_us = cmd_arguments.value_of("start-time-cpu-us").map(|s| {
+    let start_time_cpu_us = arguments.value_as_string("start-time-cpu-us").map(|s| {
         s.parse::<u64>()
             .expect("'start-time-cpu_us' parameter expected to be of 'u64' type.")
     });
 
-    let vmm_config_json = cmd_arguments
-        .value_of("config-file")
+    let vmm_config_json = arguments
+        .value_as_string("config-file")
         .map(fs::read_to_string)
         .map(|x| x.expect("Unable to open or read from the configuration file"));
 
-    let no_api = cmd_arguments.is_present("no-api");
+    let no_api = arguments.value_as_bool("no-api").unwrap_or(false);
 
     let api_shared_info = Arc::new(RwLock::new(InstanceInfo {
         state: InstanceState::Uninitialized,
-        id: instance_id,
-        vmm_version: crate_version!().to_string(),
+        id: instance_id.clone(),
+        vmm_version: FIRECRACKER_VERSION.to_string(),
     }));
 
     let request_event_fd = EventFd::new(libc::EFD_NONBLOCK)
@@ -285,7 +266,7 @@ fn start_vmm(
     api_event_fd: EventFd,
     from_api: Receiver<VmmRequest>,
     to_api: Sender<VmmResponse>,
-    seccomp_filter: SeccompFilter,
+    seccomp_filter: BpfProgram,
     config_json: Option<String>,
 ) {
     // If this fails, consider it fatal. Use expect().
@@ -329,8 +310,8 @@ fn start_vmm(
                         &api_event_fd,
                         &from_api,
                         &to_api,
-                        &vmm_seccomp_filter,
-                        &vcpu_seccomp_filter,
+                        &vmm_seccomp_filter[..],
+                        &vcpu_seccomp_filter[..],
                     ) {
                         break exit_code;
                     }
@@ -350,8 +331,8 @@ fn vmm_control_event(
     api_event_fd: &EventFd,
     from_api: &Receiver<VmmRequest>,
     to_api: &Sender<VmmResponse>,
-    vmm_seccomp_filter: &SeccompFilter,
-    vcpu_seccomp_filter: &SeccompFilter,
+    vmm_seccomp_filter: &BpfInstructionSlice,
+    vcpu_seccomp_filter: &BpfInstructionSlice,
 ) -> Result<(), u8> {
     api_event_fd.read().map_err(|e| {
         error!("VMM: Failed to read the API event_fd: {}", e);
@@ -382,11 +363,11 @@ fn vmm_control_event(
                 SetVsockDevice(vsock_cfg) => vmm
                     .set_vsock_device(vsock_cfg)
                     .map(|_| api_server::VmmData::Empty),
-                RescanBlockDevice(drive_id) => vmm
-                    .rescan_block_device(&drive_id)
-                    .map(|_| api_server::VmmData::Empty),
                 StartMicroVm => vmm
-                    .start_microvm(vmm_seccomp_filter.clone(), vcpu_seccomp_filter.clone())
+                    .start_microvm(
+                        vmm_seccomp_filter.to_owned(),
+                        vcpu_seccomp_filter.to_owned(),
+                    )
                     .map(|_| api_server::VmmData::Empty),
                 #[cfg(target_arch = "x86_64")]
                 SendCtrlAltDel => vmm.send_ctrl_alt_del().map(|_| api_server::VmmData::Empty),
@@ -414,33 +395,4 @@ fn vmm_control_event(
         }
     };
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::get_seccomp_filter;
-    use super::SeccompFilterError;
-
-    #[test]
-    fn test_parse_seccomp_ok() {
-        assert!(get_seccomp_filter("0").is_ok());
-        assert!(get_seccomp_filter("1").is_ok());
-        assert!(get_seccomp_filter("2").is_ok());
-    }
-
-    #[test]
-    fn test_parse_seccomp_err_str() {
-        match get_seccomp_filter("whatever") {
-            Err(SeccompFilterError::Parse(_)) => (),
-            _ => panic!("Unexpected result"),
-        }
-    }
-
-    #[test]
-    fn test_parse_seccomp_err_u32() {
-        match get_seccomp_filter("3") {
-            Err(SeccompFilterError::Level(_)) => (),
-            _ => panic!("Unexpected result"),
-        }
-    }
 }

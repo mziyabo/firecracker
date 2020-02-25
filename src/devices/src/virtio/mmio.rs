@@ -8,10 +8,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use byteorder::{ByteOrder, LittleEndian};
-
-use memory_model::{GuestAddress, GuestMemory};
+use utils::byte_order;
 use utils::eventfd::EventFd;
+use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::device_status;
 use super::*;
@@ -98,7 +97,7 @@ pub trait VirtioDevice: Send {
     /// Activates this device for real usage.
     fn activate(
         &mut self,
-        mem: GuestMemory,
+        mem: GuestMemoryMmap,
         interrupt_evt: EventFd,
         status: Arc<AtomicUsize>,
         queues: Vec<Queue>,
@@ -140,12 +139,12 @@ pub struct MmioDevice {
     config_generation: u32,
     queues: Vec<Queue>,
     queue_evts: Vec<EventFd>,
-    mem: Option<GuestMemory>,
+    mem: Option<GuestMemoryMmap>,
 }
 
 impl MmioDevice {
     /// Constructs a new MMIO transport for the given virtio device.
-    pub fn new(mem: GuestMemory, device: Box<dyn VirtioDevice>) -> std::io::Result<MmioDevice> {
+    pub fn new(mem: GuestMemoryMmap, device: Box<dyn VirtioDevice>) -> std::io::Result<MmioDevice> {
         let mut queue_evts = Vec::new();
         for _ in device.queue_max_sizes().iter() {
             queue_evts.push(EventFd::new(libc::EFD_NONBLOCK)?)
@@ -350,7 +349,7 @@ impl BusDevice for MmioDevice {
                         return;
                     }
                 };
-                LittleEndian::write_u32(data, v);
+                byte_order::write_le_u32(data, v);
             }
             0x100..=0xfff => self.device.read_config(offset - 0x100, data),
             _ => {
@@ -374,7 +373,7 @@ impl BusDevice for MmioDevice {
 
         match offset {
             0x00..=0xff if data.len() == 4 => {
-                let v = LittleEndian::read_u32(data);
+                let v = byte_order::read_le_u32(data);
                 match offset {
                     0x14 => self.features_select = v,
                     0x20 => {
@@ -442,7 +441,6 @@ impl BusDevice for MmioDevice {
 
 #[cfg(test)]
 mod tests {
-    use byteorder::{ByteOrder, LittleEndian};
 
     use super::*;
 
@@ -503,7 +501,7 @@ mod tests {
 
         fn activate(
             &mut self,
-            _mem: GuestMemory,
+            _mem: GuestMemoryMmap,
             interrupt_evt: EventFd,
             _status: Arc<AtomicUsize>,
             _queues: Vec<Queue>,
@@ -517,13 +515,13 @@ mod tests {
 
     fn set_device_status(d: &mut MmioDevice, status: u32) {
         let mut buf = vec![0; 4];
-        LittleEndian::write_u32(&mut buf[..], status);
+        byte_order::write_le_u32(&mut buf[..], status);
         d.write(0x70, &buf[..]);
     }
 
     #[test]
     fn test_new() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut dummy = DummyDevice::new();
         // Validate reset is no-op.
         assert!(dummy.reset().is_none());
@@ -565,7 +563,7 @@ mod tests {
 
     #[test]
     fn test_bus_device_read() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut d = MmioDevice::new(m, Box::new(DummyDevice::new())).unwrap();
 
         let mut buf = vec![0xff, 0, 0xfe, 0];
@@ -582,47 +580,47 @@ mod tests {
         // Now we test that reading at various predefined offsets works as intended.
 
         d.read(0, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), MMIO_MAGIC_VALUE);
+        assert_eq!(byte_order::read_le_u32(&buf[..]), MMIO_MAGIC_VALUE);
 
         d.read(0x04, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), MMIO_VERSION);
+        assert_eq!(byte_order::read_le_u32(&buf[..]), MMIO_VERSION);
 
         d.read(0x08, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), d.device.device_type());
+        assert_eq!(byte_order::read_le_u32(&buf[..]), d.device.device_type());
 
         d.read(0x0c, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), VENDOR_ID);
+        assert_eq!(byte_order::read_le_u32(&buf[..]), VENDOR_ID);
 
         d.features_select = 0;
         d.read(0x10, &mut buf[..]);
         assert_eq!(
-            LittleEndian::read_u32(&buf[..]),
+            byte_order::read_le_u32(&buf[..]),
             d.device.avail_features_by_page(0)
         );
 
         d.features_select = 1;
         d.read(0x10, &mut buf[..]);
         assert_eq!(
-            LittleEndian::read_u32(&buf[..]),
+            byte_order::read_le_u32(&buf[..]),
             d.device.avail_features_by_page(0) | 0x1
         );
 
         d.read(0x34, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), 16);
+        assert_eq!(byte_order::read_le_u32(&buf[..]), 16);
 
         d.read(0x44, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), false as u32);
+        assert_eq!(byte_order::read_le_u32(&buf[..]), false as u32);
 
         d.interrupt_status.store(111, Ordering::SeqCst);
         d.read(0x60, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), 111);
+        assert_eq!(byte_order::read_le_u32(&buf[..]), 111);
 
         d.read(0x70, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), 0);
+        assert_eq!(byte_order::read_le_u32(&buf[..]), 0);
 
         d.config_generation = 5;
         d.read(0xfc, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), 5);
+        assert_eq!(byte_order::read_le_u32(&buf[..]), 5);
 
         // This read shouldn't do anything, as it's past the readable generic registers, and
         // before the device specific configuration space. Btw, reads from the device specific
@@ -643,7 +641,7 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_bus_device_write() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
 
         let mut dummy_box = Box::new(DummyDevice::new());
         let dummy_dev_acked_features = &dummy_box.acked_features as *const u64;
@@ -652,7 +650,7 @@ mod tests {
         let mut d = MmioDevice::new(m, dummy_box).unwrap();
 
         let mut buf = vec![0; 5];
-        LittleEndian::write_u32(&mut buf[..4], 1);
+        byte_order::write_le_u32(&mut buf[..4], 1);
 
         // Nothing should happen, because the slice len > 4.
         d.features_select = 0;
@@ -667,7 +665,7 @@ mod tests {
         // Acking features in invalid state shouldn't take effect.
         assert_eq!(unsafe { *dummy_dev_acked_features }, 0x0);
         d.acked_features_select = 0x0;
-        LittleEndian::write_u32(&mut buf[..], 1);
+        byte_order::write_le_u32(&mut buf[..], 1);
         d.write(0x20, &buf[..]);
         assert_eq!(unsafe { *dummy_dev_acked_features }, 0x0);
 
@@ -692,13 +690,13 @@ mod tests {
 
         // now writes should work
         d.features_select = 0;
-        LittleEndian::write_u32(&mut buf[..], 1);
+        byte_order::write_le_u32(&mut buf[..], 1);
         d.write(0x14, &buf[..]);
         assert_eq!(d.features_select, 1);
 
         // Test acknowledging features on bus.
         d.acked_features_select = 0;
-        LittleEndian::write_u32(&mut buf[..], 0x124);
+        byte_order::write_le_u32(&mut buf[..], 0x124);
         // Set the device available features in order to
         // make acknowledging possible.
         unsafe {
@@ -708,7 +706,7 @@ mod tests {
         assert_eq!(unsafe { *dummy_dev_acked_features }, 0x124);
 
         d.acked_features_select = 0;
-        LittleEndian::write_u32(&mut buf[..], 2);
+        byte_order::write_le_u32(&mut buf[..], 2);
         d.write(0x24, &buf[..]);
         assert_eq!(d.acked_features_select, 2);
 
@@ -720,43 +718,43 @@ mod tests {
         // Acking features in invalid state shouldn't take effect.
         assert_eq!(unsafe { *dummy_dev_acked_features }, 0x124);
         d.acked_features_select = 0x0;
-        LittleEndian::write_u32(&mut buf[..], 1);
+        byte_order::write_le_u32(&mut buf[..], 1);
         d.write(0x20, &buf[..]);
         assert_eq!(unsafe { *dummy_dev_acked_features }, 0x124);
 
         // Setup queues
         d.queue_select = 0;
-        LittleEndian::write_u32(&mut buf[..], 3);
+        byte_order::write_le_u32(&mut buf[..], 3);
         d.write(0x30, &buf[..]);
         assert_eq!(d.queue_select, 3);
 
         d.queue_select = 0;
         assert_eq!(d.queues[0].size, 0);
-        LittleEndian::write_u32(&mut buf[..], 16);
+        byte_order::write_le_u32(&mut buf[..], 16);
         d.write(0x38, &buf[..]);
         assert_eq!(d.queues[0].size, 16);
 
         assert!(!d.queues[0].ready);
-        LittleEndian::write_u32(&mut buf[..], 1);
+        byte_order::write_le_u32(&mut buf[..], 1);
         d.write(0x44, &buf[..]);
         assert!(d.queues[0].ready);
 
         assert_eq!(d.queues[0].desc_table.0, 0);
-        LittleEndian::write_u32(&mut buf[..], 123);
+        byte_order::write_le_u32(&mut buf[..], 123);
         d.write(0x80, &buf[..]);
         assert_eq!(d.queues[0].desc_table.0, 123);
         d.write(0x84, &buf[..]);
         assert_eq!(d.queues[0].desc_table.0, 123 + (123 << 32));
 
         assert_eq!(d.queues[0].avail_ring.0, 0);
-        LittleEndian::write_u32(&mut buf[..], 124);
+        byte_order::write_le_u32(&mut buf[..], 124);
         d.write(0x90, &buf[..]);
         assert_eq!(d.queues[0].avail_ring.0, 124);
         d.write(0x94, &buf[..]);
         assert_eq!(d.queues[0].avail_ring.0, 124 + (124 << 32));
 
         assert_eq!(d.queues[0].used_ring.0, 0);
-        LittleEndian::write_u32(&mut buf[..], 125);
+        byte_order::write_le_u32(&mut buf[..], 125);
         d.write(0xa0, &buf[..]);
         assert_eq!(d.queues[0].used_ring.0, 125);
         d.write(0xa4, &buf[..]);
@@ -771,12 +769,12 @@ mod tests {
         );
 
         d.interrupt_status.store(0b10_1010, Ordering::Relaxed);
-        LittleEndian::write_u32(&mut buf[..], 0b111);
+        byte_order::write_le_u32(&mut buf[..], 0b111);
         d.write(0x64, &buf[..]);
         assert_eq!(d.interrupt_status.load(Ordering::Relaxed), 0b10_1000);
 
         // Write to an invalid address in generic register range.
-        LittleEndian::write_u32(&mut buf[..], 0xf);
+        byte_order::write_le_u32(&mut buf[..], 0xf);
         d.config_generation = 0;
         d.write(0xfb, &buf[..]);
         assert_eq!(d.config_generation, 0);
@@ -803,7 +801,7 @@ mod tests {
 
     #[test]
     fn test_bus_device_activate() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut d = MmioDevice::new(m, Box::new(DummyDevice::new())).unwrap();
 
         assert!(!d.are_queues_valid());
@@ -839,9 +837,9 @@ mod tests {
         let mut buf = vec![0; 4];
         for q in 0..d.queues.len() {
             d.queue_select = q as u32;
-            LittleEndian::write_u32(&mut buf[..], 16);
+            byte_order::write_le_u32(&mut buf[..], 16);
             d.write(0x38, &buf[..]);
-            LittleEndian::write_u32(&mut buf[..], 1);
+            byte_order::write_le_u32(&mut buf[..], 1);
             d.write(0x44, &buf[..]);
         }
         assert!(d.are_queues_valid());
@@ -872,11 +870,11 @@ mod tests {
 
         // A write which changes the size of a queue after activation; currently only triggers
         // a warning path and have no effect on queue state.
-        LittleEndian::write_u32(&mut buf[..], 0);
+        byte_order::write_le_u32(&mut buf[..], 0);
         d.queue_select = 0;
         d.write(0x44, &buf[..]);
         d.read(0x44, &mut buf[..]);
-        assert_eq!(LittleEndian::read_u32(&buf[..]), 1);
+        assert_eq!(byte_order::read_le_u32(&buf[..]), 1);
     }
 
     fn activate_device(d: &mut MmioDevice) {
@@ -891,9 +889,9 @@ mod tests {
         let mut buf = vec![0; 4];
         for q in 0..d.queues.len() {
             d.queue_select = q as u32;
-            LittleEndian::write_u32(&mut buf[..], 16);
+            byte_order::write_le_u32(&mut buf[..], 16);
             d.write(0x38, &buf[..]);
-            LittleEndian::write_u32(&mut buf[..], 1);
+            byte_order::write_le_u32(&mut buf[..], 1);
             d.write(0x44, &buf[..]);
         }
         assert!(d.are_queues_valid());
@@ -919,7 +917,7 @@ mod tests {
 
     #[test]
     fn test_bus_device_reset() {
-        let m = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+        let m = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap();
         let mut d = MmioDevice::new(m, Box::new(DummyDevice::new())).unwrap();
         let mut buf = vec![0; 4];
 
@@ -929,13 +927,13 @@ mod tests {
         activate_device(&mut d);
 
         // Marking device as FAILED should not affect device_activated state
-        LittleEndian::write_u32(&mut buf[..], 0x8f);
+        byte_order::write_le_u32(&mut buf[..], 0x8f);
         d.write(0x70, &buf[..]);
         assert_eq!(d.device_status, 0x8f);
         assert!(d.device_activated);
 
         // Nothing happens when backend driver doesn't support reset
-        LittleEndian::write_u32(&mut buf[..], 0x0);
+        byte_order::write_le_u32(&mut buf[..], 0x0);
         d.write(0x70, &buf[..]);
         assert_eq!(d.device_status, 0x8f);
         assert!(d.device_activated);

@@ -21,12 +21,12 @@ use std::vec::Vec;
 
 use dumbo::{ns::MmdsNetworkStack, EthernetFrame, MacAddr, MAC_ADDR_LEN};
 use logger::{Metric, METRICS};
-use memory_model::{GuestAddress, GuestMemory};
 use net_gen;
 use rate_limiter::{RateLimiter, TokenBucket, TokenType};
 use utils::eventfd::EventFd;
 use utils::net::{Tap, TapError};
 use virtio_gen::virtio_net::*;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryError, GuestMemoryMmap, MemoryMappingError};
 
 use super::{
     ActivateError, ActivateResult, EpollConfigConstructor, Queue, VirtioDevice, TYPE_NET,
@@ -141,7 +141,7 @@ fn init_vnet_hdr(buf: &mut [u8]) {
 pub struct NetEpollHandler {
     rx: RxVirtio,
     tap: Tap,
-    mem: GuestMemory,
+    mem: GuestMemoryMmap,
     tx: TxVirtio,
     interrupt_status: Arc<AtomicUsize>,
     interrupt_evt: EventFd,
@@ -226,16 +226,25 @@ impl NetEpollHandler {
                     }
                     let limit = cmp::min(write_count + desc.len as usize, self.rx.bytes_read);
                     let source_slice = &self.rx.frame_buf[write_count..limit];
-                    let write_result = self.mem.write_slice_at_addr(source_slice, desc.addr);
+                    let write_result = self.mem.write_slice(source_slice, desc.addr);
 
                     match write_result {
-                        Ok(sz) => {
+                        Ok(()) => {
                             METRICS.net.rx_count.inc();
-                            write_count += sz;
+                            write_count += source_slice.len();
                         }
                         Err(e) => {
                             error!("Failed to write slice: {:?}", e);
                             METRICS.net.rx_fails.inc();
+
+                            if let GuestMemoryError::MemoryAccess(
+                                _addr,
+                                MemoryMappingError::PartialBuffer { completed, .. },
+                            ) = e
+                            {
+                                write_count += completed;
+                            }
+
                             break;
                         }
                     };
@@ -442,18 +451,27 @@ impl NetEpollHandler {
             for (desc_addr, desc_len) in self.tx.iovec.drain(..) {
                 let limit = cmp::min((read_count + desc_len) as usize, self.tx.frame_buf.len());
 
-                let read_result = self.mem.read_slice_at_addr(
+                let read_result = self.mem.read_slice(
                     &mut self.tx.frame_buf[read_count..limit as usize],
                     desc_addr,
                 );
                 match read_result {
-                    Ok(sz) => {
-                        read_count += sz;
+                    Ok(()) => {
+                        read_count += limit - read_count;
                         METRICS.net.tx_count.inc();
                     }
                     Err(e) => {
                         error!("Failed to read slice: {:?}", e);
                         METRICS.net.tx_fails.inc();
+
+                        if let GuestMemoryError::MemoryAccess(
+                            _addr,
+                            MemoryMappingError::PartialBuffer { completed, .. },
+                        ) = e
+                        {
+                            read_count += completed;
+                        }
+
                         break;
                     }
                 }
@@ -769,7 +787,7 @@ impl VirtioDevice for Net {
 
     fn activate(
         &mut self,
-        mem: GuestMemory,
+        mem: GuestMemoryMmap,
         interrupt_evt: EventFd,
         status: Arc<AtomicUsize>,
         mut queues: Vec<Queue>,
@@ -914,8 +932,8 @@ mod tests {
 
     use dumbo::{EthIPv4ArpFrame, EthernetFrame, ETHERTYPE_ARP, ETH_IPV4_FRAME_LEN};
     use libc;
-    use memory_model::GuestAddress;
     use rate_limiter::TokenBucket;
+    use vm_memory::GuestAddress;
 
     use super::*;
     use crate::virtio::queue::tests::*;
@@ -1068,7 +1086,7 @@ mod tests {
     }
 
     fn activate_some_net(n: &mut Net, bad_qlen: bool, bad_evtlen: bool) -> ActivateResult {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let interrupt_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
         let status = Arc::new(AtomicUsize::new(0));
 
@@ -1095,7 +1113,7 @@ mod tests {
     }
 
     fn default_test_netepollhandler(
-        mem: &'_ GuestMemory,
+        mem: &'_ GuestMemoryMmap,
         test_mutators: TestMutators,
     ) -> (NetEpollHandler, VirtQueue<'_>, VirtQueue<'_>) {
         let mut dummy = DummyNet::new(None);
@@ -1284,7 +1302,7 @@ mod tests {
 
     #[test]
     fn test_mmds_detour_and_injection() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let sha = MacAddr::parse_str("11:11:11:11:11:11").unwrap();
@@ -1345,7 +1363,7 @@ mod tests {
 
     #[test]
     fn test_mac_spoofing_detection() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let guest_mac = MacAddr::parse_str("11:11:11:11:11:11").unwrap();
@@ -1412,7 +1430,7 @@ mod tests {
 
     #[test]
     fn test_handler_error_cases() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         // RX rate limiter events should error since the limiter is not blocked.
@@ -1434,7 +1452,7 @@ mod tests {
 
     #[test]
     fn test_invalid_event_handler() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let bad_event = 1000;
@@ -1458,7 +1476,7 @@ mod tests {
         let test_mutators = TestMutators {
             tap_read_fail: true,
         };
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, rxq) = default_test_netepollhandler(&mem, test_mutators);
 
         // The RX queue is empty.
@@ -1477,7 +1495,7 @@ mod tests {
 
     #[test]
     fn test_rx_rate_limited_event_handler() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
         let rl = RateLimiter::new(0, None, 0, 0, None, 0).unwrap();
         h.set_rx_rate_limiter(rl);
@@ -1490,7 +1508,7 @@ mod tests {
 
     #[test]
     fn test_tx_rate_limited_event_handler() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, TestMutators::default());
         let rl = RateLimiter::new(0, None, 0, 0, None, 0).unwrap();
         h.set_tx_rate_limiter(rl);
@@ -1503,7 +1521,7 @@ mod tests {
 
     #[test]
     fn test_handler() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, txq, rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let daddr = 0x2000;
@@ -1643,7 +1661,7 @@ mod tests {
             let test_mutators = TestMutators {
                 tap_read_fail: true,
             };
-            let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+            let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
             let (mut h, _txq, _rxq) = default_test_netepollhandler(&mem, test_mutators);
 
             check_metric_after_block!(&METRICS.net.rx_fails, 1, h.process_rx());
@@ -1652,7 +1670,7 @@ mod tests {
 
     #[test]
     fn test_bandwidth_rate_limiter() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, txq, rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let daddr = 0x2000;
@@ -1760,7 +1778,7 @@ mod tests {
 
     #[test]
     fn test_ops_rate_limiter() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, txq, rxq) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let daddr = 0x2000;
@@ -1870,7 +1888,7 @@ mod tests {
 
     #[test]
     fn test_patch_rate_limiters() {
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, _, _) = default_test_netepollhandler(&mem, TestMutators::default());
 
         h.set_rx_rate_limiter(RateLimiter::new(10, None, 10, 2, None, 2).unwrap());
@@ -1903,7 +1921,7 @@ mod tests {
     #[test]
     fn test_tx_queue_interrupt() {
         // Regression test for https://github.com/firecracker-microvm/firecracker/issues/1436 .
-        let mem = GuestMemory::new(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let (mut h, txq, _) = default_test_netepollhandler(&mem, TestMutators::default());
 
         let daddr = 0x2000;

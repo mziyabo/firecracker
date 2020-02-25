@@ -27,10 +27,10 @@ extern crate kernel;
 #[macro_use]
 extern crate logger;
 extern crate dumbo;
-extern crate memory_model;
 extern crate rate_limiter;
 extern crate seccomp;
 extern crate utils;
+extern crate vm_memory;
 
 /// Syscalls allowed through the seccomp filter.
 pub mod default_syscalls;
@@ -43,6 +43,7 @@ pub mod vmm_config;
 mod vstate;
 
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::io::{Read, Seek, SeekFrom};
@@ -75,14 +76,13 @@ use error::{Error, Result, UserResult};
 use kernel::cmdline as kernel_cmdline;
 use kernel::loader as kernel_loader;
 use logger::error::LoggerError;
-use logger::LogOption;
 use logger::{AppInfo, Level, Metric, LOGGER, METRICS};
-use memory_model::{GuestAddress, GuestMemory};
-use seccomp::SeccompFilter;
+use seccomp::{BpfProgram, SeccompFilter};
 use utils::eventfd::EventFd;
 use utils::net::TapError;
 use utils::terminal::Terminal;
 use utils::time::TimestampUs;
+use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
 use vmm_config::boot_source::{
     BootSourceConfig, BootSourceConfigError, KernelConfig, DEFAULT_KERNEL_CMDLINE,
 };
@@ -118,6 +118,8 @@ pub const FC_EXIT_CODE_SIGSEGV: u8 = 150;
 pub const FC_EXIT_CODE_INVALID_JSON: u8 = 151;
 /// Bad configuration for microvm's resources, when using a single json.
 pub const FC_EXIT_CODE_BAD_CONFIGURATION: u8 = 152;
+/// Command line arguments parsing error.
+pub const FC_EXIT_CODE_ARG_PARSING: u8 = 153;
 
 /// Describes all possible reasons which may cause the event loop to return to the caller in
 /// the absence of errors.
@@ -391,7 +393,7 @@ pub struct Vmm {
     // Guest VM core resources.
     kernel_config: Option<KernelConfig>,
     vcpus_handles: Vec<VcpuHandle>,
-    exit_evt: Option<EventFd>,
+    exit_evt: EventFd,
     vm: Vm,
 
     // Guest VM devices.
@@ -436,6 +438,20 @@ impl Vmm {
         let kvm = KvmContext::new().map_err(Error::KvmContext)?;
         let vm = Vm::new(kvm.fd()).map_err(Error::Vm)?;
 
+        #[cfg(target_arch = "x86_64")]
+        let pio_device_manager = PortIODeviceManager::new().map_err(Error::CreateLegacyDevice)?;
+
+        #[cfg(target_arch = "x86_64")]
+        let exit_evt = pio_device_manager
+            .i8042
+            .lock()
+            .expect("Failed to create a vmm due to poisoned i8042 lock")
+            .get_reset_evt_clone()
+            .map_err(Error::CloneEventFd)?;
+
+        #[cfg(target_arch = "aarch64")]
+        let exit_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFd)?;
+
         Ok(Vmm {
             kvm,
             vm_config: VmConfig::default(),
@@ -443,11 +459,11 @@ impl Vmm {
             stdin_handle: io::stdin(),
             kernel_config: None,
             vcpus_handles: vec![],
-            exit_evt: None,
+            exit_evt,
             vm,
             mmio_device_manager: None,
             #[cfg(target_arch = "x86_64")]
-            pio_device_manager: PortIODeviceManager::new().map_err(Error::CreateLegacyDevice)?,
+            pio_device_manager,
             device_configs,
             epoll_context,
             write_metrics_event_fd,
@@ -532,7 +548,7 @@ impl Vmm {
             );
             let rate_limiter = drive_config
                 .rate_limiter
-                .map(vmm_config::RateLimiterConfig::into_rate_limiter)
+                .map(vmm_config::RateLimiterConfig::try_into)
                 .transpose()
                 .map_err(CreateRateLimiter)?;
 
@@ -580,13 +596,13 @@ impl Vmm {
 
             let rx_rate_limiter = cfg
                 .rx_rate_limiter
-                .map(vmm_config::RateLimiterConfig::into_rate_limiter)
+                .map(vmm_config::RateLimiterConfig::try_into)
                 .transpose()
                 .map_err(CreateRateLimiter)?;
 
             let tx_rate_limiter = cfg
                 .tx_rate_limiter
-                .map(vmm_config::RateLimiterConfig::into_rate_limiter)
+                .map(vmm_config::RateLimiterConfig::try_into)
                 .transpose()
                 .map_err(CreateRateLimiter)?;
 
@@ -675,18 +691,7 @@ impl Vmm {
         })
     }
 
-    #[cfg(target_arch = "x86_64")]
-    fn log_dirty_pages(&mut self) {
-        // If we're logging dirty pages, post the metrics on how many dirty pages there are.
-        if LOGGER.flags() | LogOption::LogDirtyPages as usize > 0 {
-            METRICS.memory.dirty_pages.add(self.get_dirty_page_count());
-        }
-    }
-
     fn write_metrics(&mut self) -> result::Result<(), LoggerError> {
-        // The dirty pages are only available on x86_64.
-        #[cfg(target_arch = "x86_64")]
-        self.log_dirty_pages();
         LOGGER.log_metrics().map(|_| ())
     }
 
@@ -707,7 +712,8 @@ impl Vmm {
 
         self.vm
             .memory_init(
-                GuestMemory::new(&arch_mem_regions).map_err(StartMicrovmError::GuestMemory)?,
+                GuestMemoryMmap::from_ranges(&arch_mem_regions)
+                    .map_err(StartMicrovmError::GuestMemoryMmap)?,
                 &self.kvm,
             )
             .map_err(StartMicrovmError::ConfigureVm)
@@ -879,6 +885,7 @@ impl Vmm {
                     cpu_index,
                     self.vm.fd(),
                     self.vm.supported_cpuid().clone(),
+                    self.vm.supported_msrs().clone(),
                     self.pio_device_manager.io_bus.clone(),
                     vcpu_exit_evt,
                     request_ts.clone(),
@@ -890,7 +897,11 @@ impl Vmm {
             }
             #[cfg(target_arch = "aarch64")]
             {
-                vcpu = Vcpu::new_aarch64(cpu_index, self.vm.fd(), request_ts.clone())
+                let exit_evt = self
+                    .exit_evt
+                    .try_clone()
+                    .map_err(|_| StartMicrovmError::EventFd)?;
+                vcpu = Vcpu::new_aarch64(cpu_index, self.vm.fd(), exit_evt, request_ts.clone())
                     .map_err(StartMicrovmError::Vcpu)?;
 
                 vcpu.configure_aarch64(self.vm.fd(), vm_memory, entry_addr)
@@ -905,8 +916,8 @@ impl Vmm {
     fn start_vcpus(
         &mut self,
         mut vcpus: Vec<Vcpu>,
-        vmm_seccomp_filter: SeccompFilter,
-        vcpu_seccomp_filter: SeccompFilter,
+        vmm_seccomp_filter: BpfProgram,
+        vcpu_seccomp_filter: BpfProgram,
     ) -> std::result::Result<(), StartMicrovmError> {
         // vm_config has a default value for vcpu_count.
         let vcpu_count = self
@@ -938,9 +949,7 @@ impl Vmm {
         // Load seccomp filters for the VMM thread.
         // Execution panics if filters cannot be loaded, use --seccomp-level=0 if skipping filters
         // altogether is the desired behaviour.
-        vmm_seccomp_filter
-            .apply()
-            .map_err(StartMicrovmError::SeccompFilters)?;
+        SeccompFilter::apply(vmm_seccomp_filter).map_err(StartMicrovmError::SeccompFilters)?;
 
         // The vcpus start off in the `Paused` state, let them run.
         self.resume_vcpus()?;
@@ -957,7 +966,7 @@ impl Vmm {
         for handle in self.vcpus_handles.iter() {
             match handle
                 .response_receiver()
-                .recv_timeout(Duration::from_millis(100))
+                .recv_timeout(Duration::from_millis(1000))
             {
                 Ok(VcpuResponse::Resumed) => (),
                 _ => return Err(StartMicrovmError::VcpuResume),
@@ -1007,7 +1016,7 @@ impl Vmm {
     ///
     /// Returns the result of initrd loading
     fn load_initrd<F>(
-        vm_memory: &GuestMemory,
+        vm_memory: &GuestMemoryMmap,
         image: &mut F,
     ) -> std::result::Result<InitrdConfig, LoadInitrdError>
     where
@@ -1035,7 +1044,7 @@ impl Vmm {
 
         // Load the image into memory
         vm_memory
-            .read_to_memory(GuestAddress(address), image, size)
+            .read_from(GuestAddress(address), image, size)
             .map_err(|_| LoadInitrd)?;
 
         Ok(InitrdConfig {
@@ -1099,24 +1108,9 @@ impl Vmm {
     }
 
     fn register_events(&mut self) -> std::result::Result<(), StartMicrovmError> {
-        #[cfg(target_arch = "x86_64")]
-        {
-            use StartMicrovmError::*;
-            // If the lock is poisoned, it's OK to panic.
-            let exit_poll_evt_fd = self
-                .pio_device_manager
-                .i8042
-                .lock()
-                .expect("Failed to register events on the event fd due to poisoned lock")
-                .get_reset_evt_clone()
-                .map_err(|_| EventFd)?;
-
-            self.epoll_context
-                .add_epollin_event(&exit_poll_evt_fd, EpollDispatch::Exit)
-                .map_err(|_| RegisterEvent)?;
-
-            self.exit_evt = Some(exit_poll_evt_fd);
-        }
+        self.epoll_context
+            .add_epollin_event(&self.exit_evt, EpollDispatch::Exit)
+            .map_err(|_| StartMicrovmError::RegisterEvent)?;
 
         self.epoll_context.enable_stdin_event();
 
@@ -1134,8 +1128,8 @@ impl Vmm {
     /// Set up the initial microVM state and start the vCPU threads.
     pub fn start_microvm(
         &mut self,
-        vmm_seccomp_filter: SeccompFilter,
-        vcpu_seccomp_filter: SeccompFilter,
+        vmm_seccomp_filter: BpfProgram,
+        vcpu_seccomp_filter: BpfProgram,
     ) -> UserResult {
         info!("VMM received instance start command");
         if self.is_instance_initialized() {
@@ -1276,13 +1270,22 @@ impl Vmm {
 
             match self.epoll_context.dispatch_table[event.data as usize] {
                 Some(EpollDispatch::Exit) => {
-                    match self.exit_evt {
-                        Some(ref ev) => {
-                            ev.read().map_err(Error::EventFd)?;
-                        }
-                        None => warn!("leftover exit-evt in epollcontext!"),
-                    }
-                    self.stop(i32::from(FC_EXIT_CODE_OK));
+                    self.exit_evt.read().map_err(Error::EventFd)?;
+
+                    // Query each vcpu for the exit_code.
+                    // If the exit_code can't be found on any vcpu, it means that the exit signal
+                    // has been issued by the i8042 controller in which case we exit with
+                    // FC_EXIT_CODE_OK.
+                    let exit_code = self
+                        .vcpus_handles
+                        .iter()
+                        .find_map(|handle| match handle.response_receiver().try_recv() {
+                            Ok(VcpuResponse::Exited(exit_code)) => Some(exit_code),
+                            _ => None,
+                        })
+                        .unwrap_or(FC_EXIT_CODE_OK);
+
+                    self.stop(i32::from(exit_code));
                 }
                 Some(EpollDispatch::Stdin) => {
                     let mut out = [0u8; 64];
@@ -1337,26 +1340,6 @@ impl Vmm {
         }
         // Currently, we never get to return with Ok(EventLoopExitReason::Break) because
         // we just invoke stop() whenever that would happen.
-    }
-
-    // Count the number of pages dirtied since the last call to this function.
-    // Because this is used for metrics, it swallows most errors and simply doesn't count dirty
-    // pages if the KVM operation fails.
-    #[cfg(target_arch = "x86_64")]
-    fn get_dirty_page_count(&mut self) -> usize {
-        let dirty_pages_in_region =
-            |(slot, memory_region): (usize, &memory_model::MemoryRegion)| {
-                self.vm
-                    .fd()
-                    .get_dirty_log(slot as u32, memory_region.size())
-                    .map(|v| v.iter().map(|page| page.count_ones() as usize).sum())
-                    .unwrap_or(0 as usize)
-            };
-
-        self.vm
-            .memory()
-            .map(|ref mem| mem.map_and_fold(0, dirty_pages_in_region, std::ops::Add::add))
-            .unwrap_or(0)
     }
 
     /// Set the guest boot source configuration.
@@ -1502,10 +1485,7 @@ impl Vmm {
                 ($rate_limiter: ident, $metric: ident) => {{
                     new_cfg
                         .$rate_limiter
-                        .map(|rl| {
-                            rl.$metric
-                                .map(vmm_config::TokenBucketConfig::into_token_bucket)
-                        })
+                        .map(|rl| rl.$metric.map(vmm_config::TokenBucketConfig::into))
                         .unwrap_or(None)
                 }};
             }
@@ -1564,7 +1544,7 @@ impl Vmm {
     }
 
     /// Triggers a rescan of the host file backing the emulated block device with id `drive_id`.
-    pub fn rescan_block_device(&mut self, drive_id: &str) -> UserResult {
+    fn rescan_block_device(&mut self, drive_id: &str) -> UserResult {
         // Rescan can only happen after the guest is booted.
         if !self.is_instance_initialized() {
             return Err(DriveError::OperationNotAllowedPreBoot.into());
@@ -1579,14 +1559,6 @@ impl Vmm {
                 let new_size = File::open(&drive_config.path_on_host)
                     .and_then(|mut f| f.seek(SeekFrom::End(0)))
                     .map_err(|_| DriveError::BlockDeviceUpdateFailed)?;
-                if new_size % virtio::block::SECTOR_SIZE != 0 {
-                    warn!(
-                        "Disk size {} is not a multiple of sector size {}; \
-                         the remainder will not be visible to the guest.",
-                        new_size,
-                        virtio::block::SECTOR_SIZE
-                    );
-                }
                 return device_manager
                     .update_drive(drive_id, new_size)
                     .map_err(|_| VmmActionError::from(DriveError::BlockDeviceUpdateFailed));
@@ -1635,19 +1607,6 @@ impl Vmm {
 
         LOGGER.set_include_origin(logger_cfg.show_log_origin, logger_cfg.show_log_origin);
         LOGGER.set_include_level(logger_cfg.show_level);
-
-        #[cfg(target_arch = "aarch64")]
-        let options: &Vec<LogOption> = &vec![];
-
-        #[cfg(target_arch = "x86_64")]
-        let options = &logger_cfg.options;
-
-        LOGGER.set_flags(options).map_err(|e| {
-            VmmActionError::Logger(
-                ErrorKind::User,
-                LoggerConfigError::InitializationFailure(e.to_string()),
-            )
-        })?;
 
         LOGGER
             .init(
@@ -1720,6 +1679,8 @@ impl Vmm {
 
 #[cfg(test)]
 mod tests {
+    use vm_memory::GuestMemory;
+
     macro_rules! assert_match {
         ($x:expr, $y:pat) => {{
             if let $y = $x {
@@ -1873,7 +1834,7 @@ mod tests {
         #[allow(unused_mut)]
         fn activate(
             &mut self,
-            mem: GuestMemory,
+            mem: GuestMemoryMmap,
             interrupt_evt: EventFd,
             status: Arc<AtomicUsize>,
             queues: Vec<devices::virtio::Queue>,
@@ -2722,8 +2683,6 @@ mod tests {
             level: LoggerLevel::Warning,
             show_level: true,
             show_log_origin: true,
-            #[cfg(target_arch = "x86_64")]
-            options: vec![],
         };
 
         let mut vmm = create_vmm_object(InstanceState::Running);
@@ -2739,8 +2698,6 @@ mod tests {
             level: LoggerLevel::Debug,
             show_level: false,
             show_log_origin: false,
-            #[cfg(target_arch = "x86_64")]
-            options: vec![],
         };
         assert!(vmm.init_logger(desc).is_err());
 
@@ -2751,8 +2708,6 @@ mod tests {
             level: LoggerLevel::Debug,
             show_level: false,
             show_log_origin: false,
-            #[cfg(target_arch = "x86_64")]
-            options: vec![],
         };
         assert!(vmm.init_logger(desc).is_err());
 
@@ -2763,8 +2718,6 @@ mod tests {
             level: LoggerLevel::Warning,
             show_level: false,
             show_log_origin: false,
-            #[cfg(target_arch = "x86_64")]
-            options: vec![],
         };
         assert!(vmm.init_logger(desc).is_err());
 
@@ -2777,8 +2730,6 @@ mod tests {
             level: LoggerLevel::Info,
             show_level: true,
             show_log_origin: true,
-            #[cfg(target_arch = "x86_64")]
-            options: vec![LogOption::LogDirtyPages],
         };
         // Flushing metrics before initializing logger is not erroneous.
         assert!(vmm.flush_metrics().is_ok());
@@ -2830,14 +2781,6 @@ mod tests {
                 assert!(line.contains("Guest-boot-time ="));
             }
         }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_dirty_page_count() {
-        let mut vmm = create_vmm_object(InstanceState::Uninitialized);
-        assert_eq!(vmm.get_dirty_page_count(), 0);
-        // Booting an actual guest and getting real data is covered by `kvm::tests::run_code_test`.
     }
 
     #[test]
@@ -2895,14 +2838,14 @@ mod tests {
         assert!(vmm.load_kernel().is_ok());
     }
 
-    fn create_guest_mem_at(at: GuestAddress, size: usize) -> GuestMemory {
-        GuestMemory::new(&[(at, size)]).unwrap()
+    fn create_guest_mem_at(at: GuestAddress, size: usize) -> GuestMemoryMmap {
+        GuestMemoryMmap::from_ranges(&[(at, size)]).unwrap()
     }
 
-    fn create_guest_mem_with_size(size: usize) -> GuestMemory {
+    fn create_guest_mem_with_size(size: usize) -> GuestMemoryMmap {
         const MEM_START: GuestAddress = GuestAddress(0x0);
 
-        GuestMemory::new(&[(MEM_START, size)]).unwrap()
+        GuestMemoryMmap::from_ranges(&[(MEM_START, size)]).unwrap()
     }
 
     fn make_test_bin() -> Vec<u8> {

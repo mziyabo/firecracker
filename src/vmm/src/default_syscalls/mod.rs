@@ -11,6 +11,7 @@ mod macros;
 mod filters;
 
 pub use self::filters::default_filter;
+pub use self::filters::get_seccomp_filter;
 
 // See include/uapi/asm-generic/fcntl.h in the kernel code.
 const FCNTL_FD_CLOEXEC: u64 = 1;
@@ -42,7 +43,6 @@ const KVM_CREATE_VM: u64 = 0xae01;
 const KVM_CHECK_EXTENSION: u64 = 0xae03;
 const KVM_GET_VCPU_MMAP_SIZE: u64 = 0xae04;
 const KVM_CREATE_VCPU: u64 = 0xae41;
-const KVM_GET_DIRTY_LOG: u64 = 0x4010_ae42;
 const KVM_SET_TSS_ADDR: u64 = 0xae47;
 const KVM_CREATE_IRQCHIP: u64 = 0xae60;
 const KVM_RUN: u64 = 0xae80;
@@ -78,7 +78,6 @@ fn create_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, Error> {
         and![Cond::new(1, ArgLen::DWORD, Eq, KVM_CREATE_IRQCHIP,)?],
         and![Cond::new(1, ArgLen::DWORD, Eq, KVM_CREATE_PIT2)?],
         and![Cond::new(1, ArgLen::DWORD, Eq, KVM_CREATE_VCPU)?],
-        and![Cond::new(1, ArgLen::DWORD, Eq, KVM_GET_DIRTY_LOG,)?],
         and![Cond::new(1, ArgLen::DWORD, Eq, KVM_IOEVENTFD)?],
         and![Cond::new(1, ArgLen::DWORD, Eq, KVM_IRQFD)?],
         and![Cond::new(1, ArgLen::DWORD, Eq, KVM_SET_TSS_ADDR,)?],
@@ -105,6 +104,7 @@ fn create_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, Error> {
 mod tests {
     use super::*;
     use seccomp::SeccompFilter;
+    use std::convert::TryInto;
     use std::thread;
 
     const EXTRA_SYSCALLS: [i64; 5] = [
@@ -127,7 +127,7 @@ mod tests {
                 )
                 .is_ok());
         }
-        assert!(filter.apply().is_ok());
+        assert!(SeccompFilter::apply(filter.try_into().unwrap()).is_ok());
     }
 
     #[test]

@@ -26,8 +26,8 @@ use std::result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use memory_model::GuestMemory;
 use utils::eventfd::EventFd;
+use vm_memory::GuestMemoryMmap;
 
 use super::super::super::{DeviceEventT, Error as DeviceError};
 use super::super::queue::Queue as VirtQueue;
@@ -49,7 +49,7 @@ pub struct VsockEpollHandler<B: VsockBackend + 'static> {
     pub evvq: VirtQueue,
     pub evvq_evt: EventFd,
     pub cid: u64,
-    pub mem: GuestMemory,
+    pub mem: GuestMemoryMmap,
     pub interrupt_status: Arc<AtomicUsize>,
     pub interrupt_evt: EventFd,
     pub backend: B,
@@ -223,6 +223,7 @@ mod tests {
     use super::*;
     use crate::virtio::vsock::defs::{BACKEND_EVENT, EVQ_EVENT, RXQ_EVENT, TXQ_EVENT};
     use crate::virtio::vsock::packet::VSOCK_PKT_HDR_SIZE;
+    use vm_memory::Bytes;
 
     #[test]
     fn test_irq() {
@@ -464,7 +465,7 @@ mod tests {
     // desc_idx = 0 we are altering the header (first descriptor in the chain), and when
     // desc_idx = 1 we are altering the packet buffer.
     fn vsock_bof_helper(test_ctx: &mut TestContext, desc_idx: usize, addr: u64, len: u32) {
-        use memory_model::GuestAddress;
+        use vm_memory::GuestAddress;
 
         assert!(desc_idx <= 1);
 
@@ -489,7 +490,7 @@ mod tests {
                 let hdr_len_addr = GuestAddress(ctx.guest_txvq.dtable[0].addr.get() + 24);
                 test_ctx
                     .mem
-                    .write_obj_at_addr(len.to_le_bytes(), hdr_len_addr)
+                    .write_obj(len.to_le_bytes(), hdr_len_addr)
                     .unwrap();
             }
 
@@ -504,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_vsock_bof() {
-        use memory_model::GuestAddress;
+        use vm_memory::GuestAddress;
 
         const GAP_SIZE: usize = 768 << 20;
         const FIRST_AFTER_GAP: usize = 1 << 32;
@@ -512,7 +513,7 @@ mod tests {
         const MIB: usize = 1 << 20;
 
         let mut test_ctx = TestContext::new();
-        test_ctx.mem = GuestMemory::new(&[
+        test_ctx.mem = GuestMemoryMmap::from_ranges(&[
             (GuestAddress(0), 8 * MIB),
             (GuestAddress((GAP_START_ADDR - MIB) as u64), MIB),
             (GuestAddress(FIRST_AFTER_GAP as u64), MIB),

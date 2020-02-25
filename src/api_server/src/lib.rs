@@ -29,7 +29,7 @@ pub use micro_http::{
 use mmds::data_store;
 use mmds::data_store::Mmds;
 use parsed_request::ParsedRequest;
-use seccomp::SeccompFilter;
+use seccomp::{BpfProgram, SeccompFilter};
 use utils::eventfd::EventFd;
 use vmm::vmm_config::boot_source::BootSourceConfig;
 use vmm::vmm_config::drive::BlockDeviceConfig;
@@ -65,10 +65,6 @@ pub enum VmmAction {
     /// `VsockDeviceConfig` as input. This action can only be called before the microVM has
     /// booted.
     SetVsockDevice(VsockDeviceConfig),
-    /// Update the size of an existing block device specified by an ID. The ID is the first data
-    /// associated with this enum variant. This action can only be called after the microVM is
-    /// started.
-    RescanBlockDevice(String),
     /// Set the microVM configuration (memory & vcpu) using `VmConfig` as input. This
     /// action can only be called before the microVM has booted.
     SetVmConfiguration(VmConfig),
@@ -160,9 +156,9 @@ impl ApiServer {
         path: PathBuf,
         start_time_us: Option<u64>,
         start_time_cpu_us: Option<u64>,
-        seccomp_filter: SeccompFilter,
+        seccomp_filter: BpfProgram,
     ) -> Result<()> {
-        let mut server = HttpServer::new(path).unwrap();
+        let mut server = HttpServer::new(path).expect("Error creating the HTTP server");
 
         if let Some(start_time) = start_time_us {
             let delta_us =
@@ -185,7 +181,7 @@ impl ApiServer {
         // Load seccomp filters on the API thread.
         // Execution panics if filters cannot be loaded, use --seccomp-level=0 if skipping filters
         // altogether is the desired behaviour.
-        if let Err(e) = seccomp_filter.apply() {
+        if let Err(e) = SeccompFilter::apply(seccomp_filter) {
             panic!(
                 "Failed to set the requested seccomp filters on the API thread: Error: {:?}",
                 e
@@ -329,16 +325,18 @@ impl ApiServer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    extern crate libc;
 
+    use std::convert::TryInto;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc::channel;
+    use std::time::Duration;
     use std::{fs, thread};
 
+    use super::*;
     use micro_http::HttpConnection;
     use mmds::MMDS;
-    use std::time::Duration;
     use vmm::vmm_config::instance_info::{InstanceInfo, InstanceState};
     use vmm::{ErrorKind, StartMicrovmError, VmmActionError};
 
@@ -645,7 +643,7 @@ mod tests {
                     PathBuf::from(path_to_socket.to_string()),
                     Some(1),
                     Some(1),
-                    SeccompFilter::empty(),
+                    SeccompFilter::empty().try_into().unwrap(),
                 )
                 .unwrap();
             })
